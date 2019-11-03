@@ -1,0 +1,1 @@
+This repository contains a study and implementation using R and R-Stan of  Radford Neal's "Monte Carlo Implementation of Gaussian Process Models for Bayesian Regression and Classification". In this repository you will find both .pdf and .rmd versions.
