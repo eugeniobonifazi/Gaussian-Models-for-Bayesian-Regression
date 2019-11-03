@@ -1,0 +1,849 @@
+---
+title: "Gaussian Process Models for Bayesian Regression and Classification"
+author: "Eugenio Bonifazi"
+output: 
+  bookdown::pdf_document2: default
+bibliography: biblio.bib
+citations: TRUE
+nocite: | 
+  @bernardo1998regression, @robust_gaus
+header-includes:
+   - \usepackage{commath}
+
+
+---
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+rm(list=ls())
+library(ggplot2)
+library(rstan)
+library(reshape)
+library(gridExtra)
+library("bayesplot")
+library("ggplot2")
+library(dplyr)
+library(Metrics)
+Sys.setenv(LOCAL_CPPFLAGS = '-march=native')
+options(mc.cores = parallel::detectCores())
+
+```
+
+\newpage
+
+# Introduction
+
+## Regression and Classification with Gaussian Process
+
+This work is a study and implementation of Regression and Classification models based on the Gaussian Process, in particular following the perpective described in _"Monte Carlo Implementation of Gaussian Process Models for Bayesian Regression and Classification"_ [@neal1997monte].
+Gaussian processes are a natural way of specifying prior distributions over functions of one or more input variables. In the first part I basically describe the Regression and Classification problem focusing then on the covariance function and, in the last part an implementation of both regression and classification using R and RStan occurs.
+
+
+
+Assuming we have _n_ observations, $(x^{(1)},t^{(1)}),(x^{(2)},t^{(2)}),...,(x^{(n)},t^{(n)})$, where $x^{(i)}=x_1^{(i)},..,x_p^{(i)}$ is the vector of predictors ("inputs") related to input _i_ and _$t^{(i)}$_ is the associated target (response), a simple linear regression model can be written as:
+\[
+t^{(i)}=\alpha + \sum_{u=1}^{p}x_u^{(i)}\beta_u + \epsilon^{(i)}
+\]
+
+&nbsp;
+&nbsp;
+
+where $\epsilon^{(i)}$ is the Gaussian "noise" of the _$i^{th}$_ observation, assumed to be independent from the other cases and normally distributed, with mean zero and variance $\sigma_{\epsilon}^2$. We will assume that $\sigma_{\epsilon}^2$ is known while $\alpha$ and $\beta_u$ are unknown. We give to both parameters independent Gaussian priors with mean zero and variance $\sigma_{\alpha}^2$ and $\sigma_{u}^2$. These priors over the parameters imply a prior distribution for the associated target values $t^{(1)}, t^{(2)},...$ that is a multivariate Normal with mean zero and and covariances given by:
+
+
+\[
+Cov[t^{(i)},t^{(j)}]=E\bigg[ \bigg( \alpha + \sum_{u=1}^{p}x_u^{(i)}\beta_u + \epsilon^{(i)} \bigg)
+                             \bigg( \alpha + \sum_{u=1}^{p}x_u^{(j)}\beta_u + \epsilon^{(j)} \bigg)\bigg]
+                    = \sigma_{\alpha}^2 + \sum_{u=1}^{p}x_u^{(i)}x_u^{(j)}\sigma_u^2  + \delta_{ij}\sigma_{\epsilon}^2   \quad \quad (1)
+\]
+
+where $\delta_{ij}=1$ if $i=j$ and zero otherwise. This mean and covariance function are sufficient to define a "Gaussian process" giving a distribution over possible relationships between the inputs and the target.
+
+Suppose now that we know $x^{(1)},...,x^{(n)}$ inputs as well as the $x^{(n+1)}$ observation for which we want to predict the target. We can then condition on the known targets to obtain the predictive distribution of $t^{(n+1)}$ given $t^{(1)},...,t^{(n)}$. The _predictive distribution_ is Gaussian with mean and variance given as follows:
+\[
+E\big[t^{(n+1)} \mid t^{(1)},...,t^{(n)} \big]= k^{T}C^{-1}t
+\]
+\[
+Var\big[t^{(n+1)} \mid t^{(1)},...,t^{(n)} \big]= v-k^{T}C^{-1}k
+\]
+
+where **C** is the _n_ by _n_ covariance matrix for the targets of the observed cases, **t**$=[t^{(1)},...,t^{(n)}]^T$ is the vector of known targets, **k** is the vector of covariances between $t^{(n+1)}$ and the _n_ known targets and _v_ is the prior variance of $t^{(n+1)}$ (i.e. $Cov\big[t^{(n+1)},t^{(n+1)}\big]$).
+
+&nbsp;
+&nbsp;
+
+Models for **classification problems** can be defined in therms of a Gaussian process model for "latent values" associated with each case. When there are three or more classes, the model can be defined using K latent values for each case, $y^{(i)}_0,...,y^{(i)}_{K-1}$, with class probabilities defined as follows:
+\[
+P\big(t^{(i)}=k \big)=\frac{exp\big(-y^{(i)}_k\big)}{\sum_{s=0}^{K-1}exp\big( -y_s^{(i)}\big)}
+\]
+
+The K latent values can be given independent Gaussian process priors, such as
+\[
+Cov\big[y^{(i)},y^{(j)}\big]= \eta^2exp\Big( -\sum_{u=1}^{p}\rho^2_u(x_u^{(i)}-x_u^{(j)})^2\Big)+\delta_{ij}J^2
+\]
+
+in which _J_ is a "jitter" component added for computational reasons and it is similar to the noise in a regression model [@neal1997monte].
+
+
+
+## Covariance Matrix
+
+The covariance function can have many different structures, depending on the condition that it must result in a positive semidefinite covariance matrix. 
+In a Bayesian model, the covariance function usually depends on different "hyperparameters" that are given prior distributions as well. 
+In @neal1997monte the covariance functions supported are the sum of one or more terms of the following types:
+
+&nbsp;
+
+1) A constant part;
+
+&nbsp;
+
+2) A linear part such as \[\sum_{u=1}^{p}x_u^{(i)}x_u^{(j)}\sigma_u^2\]
+
+&nbsp;
+
+3) A jitter part, which is zero for different cases, and a constant for the covariance of a case with itself. Jitter is used to improve the conditioning of the matrix computations, or to produce the effect of a probit classification model [@neal1997monte];
+
+&nbsp;
+
+4) Any number of exponential parts, each of which has the form: \[\eta^2 \displaystyle \prod_{u=1}^p exp\bigg(- \Big(\rho_u \abs{x_u^{(i)}-x_u^{(j)}} \Big)^R \bigg)\]
+
+
+
+The plots below show four examples of Gaussian processes generated from different covariance functions using the Cholesky decomposition. These processes are produced following the stochastic representation of a multivariate normal distribution, that is 
+\[X=\mu + AZ\].
+
+$Z=(Z_1,...Z_k)$ is a k-dimentional vector with _k_ independent normal random variables, A is _(d,k)_ matrix and $\mu \in \mathbb{R}^d$ is the mean vector. The covariance matrix of X is $\Sigma=AA^T$, and the distribution of X (i.e. multivariate normal ditribution) is $X\sim N\big(\mu, \Sigma \big)$. 
+Since $\Sigma$ is a positive semidefinite matrix by definition, it can be decomposed as 
+\[\Sigma=LL^T\] 
+where _L_ is a lower triangular matrix with $L_{jj}\geq 0 \quad \forall j \in \{1,..,d\}$ and it's known as _Cholesky factor_ in the _Cholesky decomposition_ [@hofert2013sampling].
+Below some examples of Gaussian processes generated with different covariance functions with both expression and plot for each case.
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+cov_kernel1 <-function(X1,X2){
+  
+  Sigma = matrix(rep(0, length(X1)*length(X2)), nrow=length(X1))
+  
+  for (i in 1:nrow(Sigma)) {
+      for (j in 1:ncol(Sigma)) {
+        Sigma[i,j] = exp(-2*(abs(X1[i]-X2[j]))^2)
+      } }
+  return(Sigma)
+}
+
+cov_kernel2 <-function(X1,X2){
+  
+  Sigma = matrix(rep(0, length(X1)*length(X2)), nrow=length(X1))
+  
+  for (i in 1:nrow(Sigma)) {
+      for (j in 1:ncol(Sigma)) {
+        Sigma[i,j] = exp(-5^2*(abs(X1[i]-X2[j]))^2)
+      } }
+  return(Sigma)
+}
+
+cov_kernel3 <-function(X1,X2){
+  
+  Sigma = matrix(rep(0, length(X1)*length(X2)), nrow=length(X1))
+  
+  for (i in 1:nrow(Sigma)) {
+      for (j in 1:ncol(Sigma)) {
+        Sigma[i,j] = 1+X1[i]*X2[j]+0.1^2*exp(-3^2*(abs(X1[i]-X2[j]))^2)
+      } }
+  return(Sigma)
+}
+
+cov_kernel4 <-function(X1,X2){
+  
+  Sigma = matrix(rep(0, length(X1)*length(X2)), nrow=length(X1))
+  
+  for (i in 1:nrow(Sigma)) {
+      for (j in 1:ncol(Sigma)) {
+        Sigma[i,j] = exp(-2*(abs(X1[i]-X2[j]))^2)+0.1^2*exp(-5^2*(abs(X1[i]-X2[j]))^2)
+      } }
+  return(Sigma)
+}
+
+```
+
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+gp_1 <- function(X1, X2,l_1, ker){
+  
+  Sigma = ker(X1,X2)
+  
+  L = suppressWarnings(chol(Sigma, pivot = TRUE))
+  piv = order(attr(L, "pivot"))  ## reverse pivoting index
+  r = attr(L, "rank")  ## numerical rank
+  set.seed(12345)
+  X = matrix(rnorm(2 * r),2, r)
+  V = L[1:r, piv]
+  ## compute `Y = mu+X %*% V`
+  mu = 0
+  Y = mu + X %*% V
+  values = cbind(x=X1,as.data.frame(t(Y)))
+  
+
+  return(list(Y=Y, Sigma=Sigma, values=values))
+}
+
+```
+
+\newpage
+
+\[
+Cov\Big[t^{(i)},t^{(j)}\Big]=
+exp(-2(x^{(i)}-x^{(j)})^2)
+\]
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+x1 = seq(-2,2,len=50)
+x2 = seq(-2,2,len=50)
+
+gp1 = gp_1(x1, x2, ker = cov_kernel1)
+matplot(gp1$values$x, gp1$values[,-1], type="l",xlab = "x", ylab="", main=" ")
+```
+
+
+\[
+Cov\Big[t^{(i)},t^{(j)}\Big]=
+exp(-5^2(x^{(i)}-x^{(j)})^2)
+\]
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+gp2 = gp_1(x1, x2, ker = cov_kernel2)
+matplot(gp2$values$x, gp2$values[,-1], type="l",xlab = "x", ylab="", main=" ")
+```
+
+\[
+Cov\Big[t^{(i)},t^{(j)}\Big]=
+1+x^{(i)}x^{(j)}+0.1^2exp(-3^2(x^{(i)}-x^{(j)})^2)
+\]
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+gp3 = gp_1(x1, x2, ker = cov_kernel3)
+matplot(gp3$values$x, gp3$values[,-1], type="l",xlab = "x", ylab="", main=" ")
+```
+
+\[
+Cov\Big[t^{(i)},t^{(j)}\Big]=
+exp(-2(x^{(i)}-x^{(j)})^2)+0.1^2exp(-5^2(x^{(i)}-x^{(j)})^2)
+\]
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+gp4 = gp_1(x1, x2, ker = cov_kernel4)
+matplot(gp4$values$x, gp4$values[,-1], type="l",xlab = "x", ylab="", main=" ")
+```
+
+
+
+\newpage 
+
+# Applications
+
+
+## Regression models and Prior distributions
+
+In this paragraph I'm going to describe the Regression model that will be used for the applications in next session (using RStan) and specify the priors choices for the hyperparameters. Following Neal's assumption over the prior's distribution, the model used for a Gaussian process with normal outcomes, $y\in \mathbb{R}^N$, with inputs $x\in \mathbb{R}^N$ is:
+
+\[
+\rho\sim Gamma(5,5)
+\]
+\[
+\eta \sim Cauchy(0,5)
+\]
+\[
+\sigma \sim N(0,1) 
+\]
+\[
+f(x_i) \sim GP\Big(0, K\big(x\mid\rho, \eta\big)\Big)
+\]
+\[
+y_i \mid f(x),\rho,\eta,\sigma \sim N\big(f(x_i),\sigma \big) \quad \forall \text{ i } \in {1,..,n}
+\]
+
+
+Bayesian predictive inference for Gaussian processes it's sped up by deriving the posterior analytically, then directly sampling from it. The predictive distribution has the following distribution:
+\[
+p(\tilde{y}|\tilde{x}, y,x)=N(K^T\Sigma^{-1}y, \Omega-K^T\Sigma^{-1}K)
+\]
+where $\Sigma=K(x\mid \eta,\rho,\sigma )$ is the result of applying the covariance function to the inputs _x_ with observed outputs _y_, $\Omega=K(\tilde{x}\mid\eta,\rho)$ is the result of applying the covariance function to the inputs $\tilde{x}$ for which predictions are to be inferred, and K is the matrix of covariance between _x_ and $\tilde{x}$.
+
+The Stan model computes the analytic form of the posterior and provides the estimates sampling of the resulting multivariate normal through the Cholesky decomposition in order to cut down on the number of matrix-matrix multiplications when computing the conditional mean and the conditional covariance of $p(\tilde{y})$.
+The covariance function has the form 
+\[K(x|\eta,\rho, \sigma)=\eta^2exp\bigg( -\frac{1}{2\rho^2}\displaystyle \sum _{d=1}^{D}\big(x_d^{(i)}-x_d^{(j)}\big)^2\bigg)+\delta_{ij}\sigma^2\]
+
+The addition of $\sigma^2$ to the diagonal is important to ensure the positive definitness of the resulting matrix. The hyperparameter $\rho$ is the _lenght-scale_ and corresponds to the frequency of the functions represented by the Gaussian process prior with respect to the domain. Values of $\rho$ closer to zero lead the GP to represent high-frequency functions, whereas larger values of $\rho$ lead to low-frequency functions. The hyperparameter $\eta$ is the _marginal standard deviation_ and controls the magnitude of the range of the function represented by the GP [@stan_gaus]. 
+
+&nbsp;
+
+Another implementation proposed in @neal1997monte is using a t-Student distribution for the gaussian noise; the model, with hyperparameters' priors are presented below.
+
+
+\[
+\rho\sim Gamma(5,5)
+\]
+\[
+\eta \sim Cauchy(0,5)
+\]
+\[
+\sigma \sim St(4,0,1) 
+\]
+\[
+\nu \sim N(4,1) 
+\]
+\[
+f(x_i) \sim GP\Big(0, K\big(x\mid\rho, \eta\big)\Big)
+\]
+\[
+y_i \mid f(x),\rho,\eta,\sigma \sim St\big(\nu, f(x_i),\sigma \big) \quad \forall \text{ i } \in {1,..,n}
+\]
+
+
+
+
+
+
+## Regression problem with outliers
+
+For both regression and classification examples I used the same data in @neal1997monte. In this first example we have a single input generated from a standard Gaussian process and the corresponding target coming from a distribution with mean of 
+\[  
+0.3+0.4x+0.5sin(2.7x)+\frac{1.1}{1+x^2}
+\]
+
+For most cases, the distribution of the target about this mean was Gaussian with standard deviation 0.1. However, with probability 0.05, a case was made an "outlier", for which the standard deviation was 1.0 instead [@neal1997monte].
+I modeled these data with both models described in the previous paragraph, namely with Gaussian process for the expected value of the target, with the noise assumed to come from a t distribution with 4 degrees of freedom, and also under the assumption of Gaussian noise. 
+For both models I used the Stan program used within R, with 200 iterations and 4 chains. Stan performs Hybrid Monte Carlo with Hamiltonian Monte Carlo updates for the hyperparameters and noise variance as well (with 10 leapfrog updates each sample). 
+
+The results below show that the regression model with t-Student noise better fits our data without being affected by the outliers with respect to the Gaussian noise model. Hence it is clear that the heavy tails of the t-distribution allow to these data to be modeled without the outliers having an undue effect.
+Moreover, the hyperpameters' simulations seem to converge reasonably faster in the t-student case and the distribution of the posterior's simulation better fits the "_true y_" distribution as well.
+
+&nbsp;
+&nbsp;
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Data load and visualization
+
+d = read.table('data')
+train = (data.frame(cbind(x1=d$V1[1:150],y1=d$V2[1:150])))
+test = (data.frame(cbind(x2=d$V1[151:200],y2=d$V2[151:200])))
+
+
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Gaussian Noise 
+
+x=seq(-2.7,2.7,length=150)
+x1=seq(-2.7,2.7,length=200)
+
+stan_data = list(N1=length(train$x1), x1=train$x1, y1 = train$y1, N2=length(x), x2=x)
+#normal_fit = stan(file = 'Stan/predictive_gp.stan', data = stan_data, iter = 200, chains = 4, cores = 4, thin = 1)
+#setwd(("Stan/"))
+#saveRDS(normal_fit, file="predictive_gp.rds")
+
+setwd(("Stan/"))
+normal_fit=readRDS("predictive_gp.rds", refhook = NULL)
+setwd("../")
+samps_gp_mod_lat_gaus = rstan::extract(normal_fit)
+
+```
+
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Student noise 
+
+obs=c(1:150)
+stan_data2 <- list(N_predict=200, x_predict=d$V1,N_observed=150,y_observed=train$y1,observed_idx=obs)
+
+#stud_fit = stan(file = 'Stan/stud_noise.stan', data = stan_data2, iter = 200, chains = 4, cores = 4, thin = 1)
+
+#saveRDS(stud_fit, file="stud_noise_gp.rds")
+
+setwd(("Stan/"))
+stud_fit=readRDS("stud_noise_gp.rds", refhook = NULL)
+setwd("../")
+cau = rstan::extract(stud_fit)
+
+```
+
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+post_pred_gaus = data.frame(x = x1,
+                            pred_mu = colMeans(samps_gp_mod_lat_gaus$y2))
+plt_df_rt_gaus = data.frame(x = x1, f = t(samps_gp_mod_lat_gaus$y2[1:200,]))
+plt_df_rt_melt_gaus = melt(plt_df_rt_gaus,id.vars = 'x')
+
+plt_cau = data.frame(x=stan_data2$x_predict, pred2 = colMeans(cau$y_predict))
+plt_st = data.frame(x = stan_data2$x_predict, f = t(cau$y_predict[1:200,]))
+plt_melt_st = melt(plt_st,id.vars = 'x')
+
+
+plt = ggplot(data = train, aes(x=train$x1, y=train$y1))+
+  geom_line(data = plt_df_rt_melt_gaus, aes(x = x, y = value, group = variable, colour = 'Posterior functions, Gaus'), alpha = 0.15)+ theme_bw() + theme(legend.position="bottom") +
+  geom_line(data = plt_melt_st, aes(x = x, y = value, group = variable, colour = 'Posterior functions, St'), alpha = 0.15) + theme_bw() + theme(legend.position="bottom") +
+  geom_point(aes(colour = 'Data')) + theme_bw() + theme(legend.position="bottom") +
+  geom_line(data = post_pred_gaus, aes(x = x, y = pred_mu, colour = 'Predictive mean-G. noise'),alpha = 0.9) + theme_bw() + theme(legend.position="bottom") +
+  geom_line(data = plt_cau, aes(x = x, y = pred2, colour = 'Predictive mean-St. noise'),alpha = 0.9)  + theme_bw() + theme(legend.position="bottom") +
+  scale_color_manual(name = '', values = c('Data'='black','Posterior functions, Gaus'= 'darkseagreen2','Predictive mean-G. noise'='darkgreen', 'Predictive mean-St. noise'='red','Posterior functions, St'='lightsalmon' )) + 
+  scale_y_continuous(limits = c(min(x), max(x))) +guides(fill=guide_legend(nrow=2,byrow=TRUE))+
+  xlab('X') +
+  ylab('y') +
+  ggtitle(paste0('Predictions with Gaussian Process Regression'))
+
+plt
+
+```
+
+
+\newpage
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+trace_plt = traceplot(normal_fit, par=c("rho", "alpha", "sigma"))+ ggtitle("Parameters' traceplots")+theme(plot.title = element_text(size=10,face = "bold"))
+dens_plt = ppc_dens_overlay(d$V2, samps_gp_mod_lat_gaus$y2)+ggtitle("Distributions of both data and simulations")+theme(plot.title = element_text(size=10, face = "bold"))
+grid.arrange(trace_plt,dens_plt, nrow=2, top = "Gaussian noise regression plots")
+
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+trace_plt = traceplot(stud_fit, par=c("rho", "eta", "s"))+ ggtitle("Parameters' traceplots")+theme(plot.title = element_text(size=10,face = "bold"))
+dens_plt = ppc_dens_overlay(d$V2, cau$y_predict)+ggtitle("Distributions of both data and simulations")+theme(plot.title = element_text(size=10,face = "bold"))
+grid.arrange(trace_plt,dens_plt, nrow=2, top = "Student noise regression plots")
+
+```
+
+
+
+\newpage
+**GP-Regression with Gaussian noise** _(Stan code)_
+
+```{r}
+
+# functions {
+# 
+#   vector gp_pred_rng(real[] x2,
+#                      vector y1,
+#                      real[] x1,
+#                      real alpha,
+#                      real rho,
+#                      real sigma,
+#                      real delta) {
+#     int N1 = rows(y1);
+#     int N2 = size(x2);
+#     vector[N2] f2;
+#     {
+#       matrix[N1, N1] L_K;
+#       vector[N1] K_div_y1;
+#       matrix[N1, N2] k_x1_x2;
+#       matrix[N1, N2] v_pred;
+#       vector[N2] f2_mu;
+#       matrix[N2, N2] cov_f2;
+#       matrix[N2, N2] diag_delta;
+#       matrix[N1, N1] K;
+#       K = cov_exp_quad(x1, alpha, rho);
+#       for (n in 1:N1)
+#         K[n, n] = K[n,n] + square(sigma);
+#       L_K = cholesky_decompose(K);
+#       K_div_y1 = mdivide_left_tri_low(L_K, y1);
+#       K_div_y1 = mdivide_right_tri_low(K_div_y1', L_K)';
+#       k_x1_x2 = cov_exp_quad(x1, x2, alpha, rho);
+#       f2_mu = (k_x1_x2' * K_div_y1);
+#       v_pred = mdivide_left_tri_low(L_K, k_x1_x2);
+#       cov_f2 = cov_exp_quad(x2, alpha, rho) - v_pred' * v_pred;
+#       diag_delta = diag_matrix(rep_vector(delta, N2));
+# 
+#       f2 = multi_normal_rng(f2_mu, cov_f2 + diag_delta);
+#     }
+#     return f2;
+#   }
+# }
+# data {
+#   int<lower=1> N1;
+#   real x1[N1];
+#   vector[N1] y1;
+#   int<lower=1> N2;
+#   real x2[N2];
+# }
+# transformed data {
+#   vector[N1] mu = rep_vector(0, N1);
+#   real delta = 1e-9;
+# }
+# parameters {
+#   real<lower=0> rho;
+#   real<lower=0> alpha;
+#   real<lower=0> sigma;
+# 
+# }
+# model {
+#   matrix[N1, N1] L_K;
+#   {
+#     matrix[N1, N1] K = cov_exp_quad(x1, alpha, rho);
+#     real sq_sigma = square(sigma);
+# 
+#     // diagonal elements
+#     for (n1 in 1:N1)
+#       K[n1, n1] = K[n1, n1] + sq_sigma;
+# 
+#     L_K = cholesky_decompose(K);
+#   }
+# 
+#   rho ~ gamma(5, 5);
+#   alpha ~ cauchy(0,5);
+#   sigma ~ std_normal();
+# 
+#   y1 ~ multi_normal_cholesky(mu, L_K);
+# }
+# generated quantities {
+#   vector[N2] f2;
+#   vector[N2] y2;
+# 
+#   f2 = gp_pred_rng(x2, y1, x1, alpha, rho, sigma, delta);
+#   for (n2 in 1:N2)
+#     y2[n2] = normal_rng(f2[n2], sigma);
+# }
+
+```
+
+
+
+\newpage
+**GP-Regression with t-distributed noise** _(Stan code)_
+
+```{r}
+# data {
+#   int<lower=1> N_predict;
+#   real x_predict[N_predict];
+# 
+#   int<lower=1> N_observed;
+#   int<lower=1, upper=N_predict> observed_idx[N_observed];
+#   real  y_observed[N_observed];
+# 
+#   
+# }
+# 
+# transformed data {
+#   
+# }
+# 
+# parameters {
+#   vector[N_predict] f_tilde;
+#   real<lower=0> dof; // Degrees of freedom for t
+#   real<lower=0> s; // scale parametr for T
+#   real<lower=0> rho; // lengthscale
+#   real<lower=0> eta; //magnitude
+# }
+# 
+# transformed parameters {
+#  
+#   matrix[N_predict, N_predict] cov =   cov_exp_quad(x_predict, eta, rho)
+#                      + diag_matrix(rep_vector(1e-10, N_predict));
+#   matrix[N_predict, N_predict] L_cov = cholesky_decompose(cov);
+#   vector[N_predict] f_predict = L_cov * f_tilde;
+# }
+# 
+# model {
+#   eta ~ cauchy(0,5);
+#   rho ~ gamma(5,5);
+#   f_tilde ~ normal(0, 1);
+#   dof ~ normal (4,0.2);
+#   s ~ student_t(4,0,1);
+#   y_observed ~ student_t(dof, f_predict[observed_idx], s);//defines the likelihood
+# }
+# 
+# generated quantities {
+#   vector[N_predict] y_predict;
+#   for (n in 1:N_predict)
+#     y_predict[n] = student_t_rng(dof, f_predict[n], s);// out of sample predictions
+# }
+
+```
+
+
+\newpage
+
+## A three-way classification problem
+
+
+In this last paragraph we deal with the classification problem. We have a three-class target variable and four independent variables. I used Neal's data that are built in the following way: the four variables $x_1,x_2, x_3$ and $x_4$ are indepentently drawn from a $Unif(0,1)$; then the target variable takes value 0 if the euclidean distance between $(x_1^{i},x_2^i)$ and the point (0.4,0.5) is less than 0.35, we have $y=1$ if $0.8*x_1^i+1.8x_2^i<0.6$ and, finally, we have $y=2$ otherwise.
+It is clear that the latent variable depends just on the first two variables ($x_1$ and $x_2$) and this relashionship between variables should demostrate the correct functioning of the model. For this classification problem the covariance structure has a different parametrization over the parameters: 
+\[
+K(x|\eta,\rho, \sigma)= c + \eta^2exp\bigg( -\displaystyle \sum _{d=1}^{D}\frac{1}{2\rho^2_{u}}\big(x_d^{(i)}-x_d^{(j)}\big)^2\bigg)+\delta_{ij}\sigma^2
+\]
+
+where each variable has its own parameter $\rho_u$ that can vary separetely from the others giving the model the capability to understand if an input is significant to explain the dependent value. on the contrary, if an input is irrelavant its posterior prediction should be close to zero.
+This estimation of $\rho$ is defined as "_automatic relavance determination_" in @neal2012bayesian, but this is misleading, because the magnitude the scale of the posterior for each $\rho_u$ is dependent on the scaling of the input data and, moreover, the scale of the parameters $\rho_u$ measures non-linearity along the _d_-th dimention. 
+With one covariate,i.e. $x_1$,  having a linear effect and another covariate $x_2$ having a nonlinear effect, it is possible that $\rho_1>\rho_2$ even if the predictive relevance of $x_1$ is higher [@williams2006gaussian].
+
+&nbsp;
+&nbsp;
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+classdata = read.table("classdata")
+p=ggplot(classdata, aes(x = classdata$V1,y = classdata$V2))+geom_point(aes(color = factor(classdata$V5)))+xlab("x1")+ylab("x2")+ggtitle(paste0('Data scatter plot'))
+p+scale_color_discrete(name = "Target variable y")
+```
+
+In order to apply the Gaussian process to a classification problem we need a function that allows us to express the probability that a certain observation belongs to a specific tharget, according with the corresponding covariates values. This function is called _softmax_ and it has the following expression (already shown in the Introduction paragraph):
+
+\[
+P\big(t^{(i)}=k \big)=\frac{exp\big(-y^{(i)}_k\big)}{\sum_{s=0}^{K-1}exp\big( -y_s^{(i)}\big)}
+\]
+
+Hence the model has the following structure and prior distributions:
+
+\[
+\rho\sim Gamma(5,5)
+\]
+\[
+\eta \sim Cauchy(0,5)
+\]
+\[
+\sigma \sim St(4,0,1) 
+\]
+\[
+f(x_i) \sim GP\Big(0, K\big(x\mid\rho, \eta\big)\Big)
+\]
+\[
+y_i \mid f(x),\rho,\eta,\sigma \sim Mltn\big(y_i\mid softmax(f(x_i)))
+\]
+
+The result obtained show that the algorithm works quite good regarding the identification of irrelevant inputs: posterior estimates of the coefficients of both $x_2$ and $x_3$ are close to 0, in contrast to $\rho_1$ and $\rho_2$ whose estimates are around 2. Taking into account the accuracy of the classification, after splitting the dataset into train and test I obtain a good accuracy in the train (99%) while just the 70% on the test. This pour result could have been caused by the unbalancy of the dataset (we have 380 0s, 507 observations in which y=2 and just 112 for which y=1). Further works can be focused on the improvement of the classification accuracy. 
+
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+#Take every D-dimensional input for each class
+#X_0
+x_0 = classdata[which(classdata$V5==0),]
+#X_1
+x_1 = classdata[which(classdata$V5==1),]
+#X_2
+x_2 = classdata[which(classdata$V5==2),]
+#Split the dataset
+train = rbind(x_0[1:150,],x_1[1:50,],x_2[1:300,])
+test=rbind(x_0[151:381,],x_1[51:112,],x_2[301:507,])
+
+
+#Compile the model
+#comp_gp_mod_lat = stan_model(file = 'STAN/class.stan')
+#Parse the data
+stan_dat = list(N=500,N_pred=500,x1=train[,1],x2=train[,2],x3=train[,3],
+                 x4=train[,4],x_1=test[,1],x_2=test[,2],x_3=test[,3],
+                 x_4=test[,4],y=train[,5],S_train=sum(train[,5]),
+                 S_test=sum(test[,5]))
+#Sampling
+#gp_mod_lat_class = sampling(comp_gp_mod_lat, data = stan_dat,iter = 300,chain=3, control = list(adapt_delta = 0.95))
+#samps_gp_mod_lat = extract(gp_mod_lat_class)
+
+#saveRDS(gp_mod_lat_class, file="class_mod1.rds")
+setwd(("Stan/"))
+class_fit=readRDS("class_mod1.rds", refhook = NULL)
+setwd("../")
+samps_gp_mod_lat = extract(class_fit)
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+classify = function(x){
+  for (i in 1:length(x)) {
+    if (any(x[i]<=0.5)==T){
+      x[i]=0
+    }else if (any(1.5>=x[i] &&x[i]>0.5)==T){
+      x[i]=1
+    } else {
+      x[i]=2
+    }
+  }
+  return(x)
+  
+}
+
+#Plot the relevances rho
+rhos = cbind(samps_gp_mod_lat$rho1,samps_gp_mod_lat$rho2,samps_gp_mod_lat$rho3,
+             samps_gp_mod_lat$rho4)
+rho = matrix(rhos,ncol=4) 
+matplot(rho, type = c("l"),pch=1,col = c("black", "green","red","blue"),
+        main="rho vectors over iterations")
+legend("topleft", legend = c("p1","p2","p3","p4"), col=c("black", "green","red","blue"),lty=1:2, cex=0.47) 
+
+##Measure performance
+##ACCURACY ON TRAIN
+train_means = colMeans(samps_gp_mod_lat$y_pred_in)
+acc_train = accuracy(classify(train_means),train[,5])
+
+##ACCURACY ON TEST
+test_means = colMeans(samps_gp_mod_lat$y_pred)
+acc_test = round(accuracy(classify(test_means),test[,5]),2)
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+tr_cov = traceplot(class_fit, par=c("rho1", "rho2", "rho3", "rho4"))+ggtitle("Exp. part hyperparameters' traceplots")+ theme_bw()+theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, face = "bold"))
+tr_hyp = traceplot(class_fit, par=c("magnitude", "delta", "jitter"))+ggtitle("Hyperparameters' traceplots")+ theme_bw()+
+  theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, face = "bold"))
+tr_hyp
+
+```
+
+&nbsp;
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+tr_cov
+```
+
+\newpage
+
+**Classification with Gaussian Process** _(Stan code)_
+
+```{r}
+
+# functions{
+# 		
+# /// Automatic Relevance Determination
+# 	matrix rbf(int N,int N_pred,vector x1,
+#                      vector x2,vector x3,vector x4,vector x_1,
+#                      vector x_2,vector x_3,vector x_4, real alpha,real rho1,
+#                             real rho2,real rho3,real rho4,real delta,real jitter) {
+#     int Nx = N;
+#     int Ny = N_pred;
+#     matrix[Nx, Ny] K;
+#     real sq_alpha = square(alpha);
+#     real sq_1 = square(rho1);
+#     real sq_2 = square(rho2);
+#     real sq_3 = square(rho3);
+#     real sq_4 = square(rho4);
+#     for (i in 1:(Nx-1)) {
+#       
+#       K[i, i] = sq_alpha + delta;
+#       
+#       for (j in (i + 1):Ny) {
+#         
+#         K[i, j] =  sq_alpha * 
+#           exp(-0.5*sq_1*(x1[i] - x_1[j])^2 - 0.5*sq_2*(x2[i] - x_2[j])^2  - 
+#           0.5*sq_3*(x3[i] - x_3[j])^2  -  0.5*sq_4*(x4[i] - x_4[j])^2 );
+#         
+# 
+#         K[j, i] = K[i, j];
+#       }
+#     }
+# 
+#     K[Nx, Ny] = sq_alpha + delta;
+#     
+#     return K + jitter;
+#   }
+# 
+# 
+#   vector gp_pred_rng(int N,int N_pred,
+#                      vector y1, vector x1,
+#                      vector x2,vector x3,vector x4,vector x_1,
+#                      vector x_2,vector x_3,vector x_4,
+#                      real magnitude,real rho1,
+#                             real rho2,real rho3,real rho4,real delta,real jitter) {
+#     
+#     vector[N_pred] f2;
+#     {
+#       matrix[N, N] C = rbf(N,N,x1,x2,x3,x4,x1,
+#                      x2,x3,x4, magnitude,rho1,rho2,rho3,rho4,delta,jitter);  
+#       
+#       matrix[N, N] L_K = cholesky_decompose(C);
+#       vector[N] L_K_div_y1 = mdivide_left_tri_low(L_K, y1);
+#       vector[N] K_div_y1 = mdivide_right_tri_low(L_K_div_y1', L_K)';
+#       matrix[N, N_pred] k_x_x_pred = rbf(N,N_pred,x1,x2,x3,x4,x_1,
+#                      x_2,x_3,x_4, magnitude,rho1,rho2,rho3,rho4,delta,jitter);
+#       f2 = (k_x_x_pred' * K_div_y1);
+#     }
+#     return f2;
+#   }
+# } 
+# 
+# data {
+#   int<lower=1> N;
+#   //for train cases
+#   vector[N] x1;
+#   vector[N] x2;
+#   vector[N] x3;
+#   vector[N] x4;
+#   int<lower=1> N_pred;
+#   // for test cases
+#   vector[N_pred] x_1;
+#   vector[N_pred] x_2;
+#   vector[N_pred] x_3;
+#   vector[N_pred] x_4;
+#   int<lower=0,upper=2> y[N];
+#   int<lower=1> S_train;
+#   int<lower=1> S_test;
+# }
+# transformed data {
+# //real delta = 1e-10;
+# }
+# parameters {
+#   real<lower=0> magnitude;
+#   real<lower=0> rho1;
+#   real<lower=0> rho2;
+#   real<lower=0> rho3;
+#   real<lower=0> rho4;
+#   
+#   real<lower=10> delta;
+#    real<lower=0> jitter;
+#   
+#   vector[N] f_tilde;
+# }
+# transformed parameters {
+#   vector[N] f;
+#   
+#   {
+#     matrix[N, N] C;
+#     matrix[N, N] L_cov;   
+#     C = rbf(N,N,x1,x2,x3,x4,x1,
+#                      x2,x3,x4, magnitude,rho1,rho2,rho3,rho4,delta,jitter);   
+#     L_cov = cholesky_decompose(C);
+#     f = L_cov * f_tilde;
+#   }
+# }
+# model {
+#   //Hyperparameters
+#   magnitude ~ cauchy(0,5);
+#   rho1 ~ gamma(5,5);
+#   rho2 ~ gamma(5,5);
+#   rho3 ~ gamma(5,5);
+#   rho4 ~ gamma(5,5);
+#   f_tilde ~ normal(0, 1);
+#   
+#   delta ~ normal(10,1);
+#   jitter ~ cauchy(0,5);
+#   y ~ multinomial(softmax(f)); //Likelihood
+# }
+# generated quantities {
+#   vector[N_pred] f_pred =  gp_pred_rng(N,N_pred,f,x1,x2,x3,x4,x_1,x_2,x_3,x_4,magnitude,rho1,rho2,rho3,rho4,delta,jitter);
+#   int y_pred[N_pred];
+#   int y_pred_in[N];
+#   
+#    y_pred_in = multinomial_rng(softmax(f),S_train); 
+#    y_pred = multinomial_rng(softmax(f_pred),S_test); 
+# }
+
+```
+
+
+\newpage
+
+# References
